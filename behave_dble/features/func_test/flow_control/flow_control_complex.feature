@@ -1,13 +1,14 @@
 # Copyright (C) 2016-2021 ActionTech.
 # License: https://www.mozilla.org/en-US/MPL/2.0 MPL version 2 or higher.
 # update by quexiuping at 2021/7/22
-
+# modified by wujinling at 2021/10/20
 
 Feature: test flow_control about complex query
-
-@skip
+  @delete_mysql_tables
   Scenario: test flow_control about complex query   # 1
-    # prepare data
+    """
+    {'delete_mysql_tables':['mysql-master1','mysql-master2']}
+    """
     Given update file content "/opt/dble/conf/bootstrap.cnf" in "dble-1" with sed cmds
        """
        s/-Xmx1G/-Xmx4G/
@@ -15,22 +16,33 @@ Feature: test flow_control about complex query
        s/-Dprocessors=1/-Dprocessors=4/
        s/-DprocessorExecutor=1/-DprocessorExecutor=8/
 
-       $a -DbufferPoolChunkSize=256
-       $a -DprocessorCheckPeriod=1
-       $a -DfrontSocketSoSndbuf=4096
-       $a -DfrontSocketNoDelay=0
        $a -DenableFlowControl=true
-       $a -DflowControlStartThreshold=2
-       $a -DflowControlStopThreshold=1
+       $a -DflowControlHighLevel=1048576
+       $a -DflowControlLowLevel=262144
        $a -DsqlExecuteTimeout=1800000
        $a -DidleTimeout=1800000
        """
-    Given update file content "/opt/dble/conf/log4j2.xml" in "dble-1" with sed cmds
-      """
-      s/debug/info/g
-      """
+    Given add xml segment to node with attribute "{'tag':'root'}" in "db.xml"
+    """
+    <dbGroup rwSplitMode="0" name="ha_group1" delayThreshold="100" >
+        <heartbeat>select user()</heartbeat>
+        <dbInstance name="M1" password="111111" url="172.100.9.5:3307" user="test" maxCon="100" minCon="10" primary="true">
+             <property name="flowHighLevel">4048576</property>
+             <property name="flowLowLevel">262144</property>
+        </dbInstance>
+     </dbGroup>
+
+    <dbGroup rwSplitMode="0" name="ha_group2" delayThreshold="100" >
+        <heartbeat>select user()</heartbeat>
+        <dbInstance name="hostM2" password="111111" url="172.100.9.6:3307" user="test" maxCon="100" minCon="10" primary="true">
+             <property name="flowHighLevel">4048576</property>
+             <property name="flowLowLevel">262144</property>
+        </dbInstance>
+    </dbGroup>
+     """
     Then Restart dble in "dble-1" success
 
+    # prepare data
     Then execute sql in "dble-1" in "user" mode
       | conn   | toClose | sql                                                                                                                                                                  | expect  | db      | charset |
       | conn_1 | true    | drop table if exists sharding_2_t1                                                                                                                                   | success | schema1 | utf8mb4 |
@@ -47,7 +59,6 @@ Feature: test flow_control about complex query
     Given execute sql "18" times in "dble-1" at concurrent 18
       | sql                                                                                | db      |
       | insert into sharding_4_t1(id,a,b,c,d) select id,a,b,c,d from sharding_4_t1         | schema1 |
-    Then Restart dble in "dble-1" success
 
     Then execute sql in "dble-1" in "user" mode
       | conn   | toClose | sql                                                   | expect  | db      | charset |
@@ -56,81 +67,77 @@ Feature: test flow_control about complex query
       | conn_1 | true    | create view view1 as select * from sharding_2_t1      | success | schema1 | utf8mb4 |
       | conn_1 | true    | create view view2 as select * from sharding_4_t1      | success | schema1 | utf8mb4 |
 
-    #####  case 1: unsupported view select #####
-    # query would "hang"
+    #####  case 1: view select #####
     Given execute sqls in "dble-1" at background
       | conn    | toClose | sql                                 | db      | charset |
       | conn_2  | true    | select * from view1 join view2      | schema1 | utf8mb4 |
-    # 9066 execute cmd
     Then execute sql in "dble-1" in "admin" mode
       | conn   | toClose | sql                                                                                     | expect  | db               |
-      | conn_0 | true    | select conn_send_task_queue,sql from session_connections                                | success | dble_information |
+      | conn_0 | true    | select * from dble_flow_control where flow_controlled=true                                | success | dble_information |
       | conn_0 | true    | flow_control @@list                                                                     | success | dble_information |
-
-
+      | conn_0 | true    | flow_control @@set flowControlHighLevel=131072 flowControlLowLevel=65536                | success | dble_information |
     Then check following text exist "N" in file "/tmp/dble_user_query.log" in host "dble-1"
       """
       closed
       Lost connection
       """
- # due to   DBLE0REQ-1275
-#    Given sleep "5" seconds
+    Given sleep "3" seconds
     Given kill mysql query in "dble-1" forcely
       """
       select * from view1 join view2
       """
-    Then execute sql in "dble-1" in "admin" mode
-      | conn   | toClose | sql                                                                                     | expect  | db               |
-      | conn_0 | true    | select conn_send_task_queue,sql from session_connections                                | success | dble_information |
-      | conn_0 | true    | flow_control @@list                                                                     | success | dble_information |
-      | conn_0 | true    | flow_control @@set enableFlowControl=true flowControlStart=2 flowControlEnd=1           | success | dble_information |
-
     Then check following text exist "N" in file "/opt/dble/logs/dble.log" in host "dble-1"
       """
-      begins flow control
-      remove flow control
       NullPointerException
       caught err:
       """
+    Then check following text exist "Y" in file "/opt/dble/logs/dble.log" in host "dble-1"
+      """
+      This backend connection begins flow control, currentReadingSize=
+      This backend connection stop flow control, currentReadingSize=
+      """
+    #check not effect the flowing sqls and the small sql will not trigger flow control
+    Given record current dble log line number in "log_linenu"
     Then execute sql in "dble-1" in "user" mode
       | conn   | toClose | sql                                                   | expect        | db      | charset |
       | conn_1 | true    | select * from sharding_2_t1 limit 100                 | length{(100)} | schema1 | utf8mb4 |
-    Given execute linux command in "dble-1"
+    Then check following text exist "N" in file "/opt/dble/logs/dble.log" after line "log_linenu" in host "dble-1"
       """
-      rm -rf /opt/dble/Memory*
+      This backend connection begins flow control, currentReadingSize=
+      This front connection begins flow control, currentWritingSize=
       """
+    #restart dble for generate new dble.log
     Then Restart dble in "dble-1" success
 
 
-    #####  case 2: supported view select #####
+    #####  case 2: view sub-query #####
     Given execute sqls in "dble-1" at background
       | conn    | toClose | sql                                        | db      | charset |
       | conn_3  | true    | select * from (select * from view1) a      | schema1 | utf8mb4 |
     Then execute sql in "dble-1" in "admin" mode
       | conn   | toClose | sql                                                                                     | expect  | db               |
-      | conn_0 | true    | select conn_send_task_queue,sql from session_connections                                | success | dble_information |
+      | conn_0 | true    | select * from dble_flow_control where flow_controlled=true                                | success | dble_information |
       | conn_0 | true    | flow_control @@list                                                                     | success | dble_information |
-      | conn_0 | true    | flow_control @@set enableFlowControl=true flowControlStart=2 flowControlEnd=1           | success | dble_information |
+      | conn_0 | true    | flow_control @@set flowControlHighLevel=65536 flowControlLowLevel=2000                | success | dble_information |
 
     Then check following text exist "N" in file "/tmp/dble_user_query.log" in host "dble-1"
       """
       closed
       Lost connection
       """
-#    Given sleep "5" seconds
+    Given sleep "3" seconds
     Given kill mysql query in "dble-1" forcely
       """
       select * from (select * from view1) a
       """
     Then execute sql in "dble-1" in "admin" mode
       | conn   | toClose | sql                                                                                     | expect  | db               |
-      | conn_0 | true    | select conn_send_task_queue,sql from session_connections                                | success | dble_information |
+      | conn_0 | true    | select * from dble_flow_control where flow_controlled=true                                | success | dble_information |
       | conn_0 | true    | flow_control @@list                                                                     | success | dble_information |
-      | conn_0 | true    | flow_control @@set enableFlowControl=true flowControlStart=2 flowControlEnd=1           | success | dble_information |
     Then check following text exist "Y" in file "/opt/dble/logs/dble.log" in host "dble-1"
       """
-      begins flow control
-      remove flow control
+      This backend connection begins flow control, currentReadingSize=
+      This backend connection stop flow control, currentReadingSize=
       """
     Then execute sql in "dble-1" in "user" mode
       | conn   | toClose | sql                                                   | expect        | db      | charset |
@@ -141,131 +148,74 @@ Feature: test flow_control about complex query
       NullPointerException
       caught err:
       """
-    Given execute linux command in "dble-1"
-      """
-      rm -rf /opt/dble/Memory*
-      """
     Then Restart dble in "dble-1" success
 
-
-    #####  case 3: unsupported complex select  #####
-    Given execute sqls in "dble-1" at background
-      | conn    | toClose | sql                                                                    | db      | charset |
-      | conn_4  | true    | select * from sharding_2_t1 a join sharding_4_t1  b on a.id = b.id     | schema1 | utf8mb4 |
-    Then execute sql in "dble-1" in "admin" mode
-      | conn   | toClose | sql                                                                                     | expect  | db               |
-      | conn_0 | true    | select conn_send_task_queue,sql from session_connections                                | success | dble_information |
-      | conn_0 | true    | flow_control @@list                                                                     | success | dble_information |
-
-    Then check following text exist "N" in file "/tmp/dble_user_query.log" in host "dble-1"
-      """
-      closed
-      Lost connection
-      """
-#    Given sleep "5" seconds
-    Given kill mysql query in "dble-1" forcely
-      """
-      select * from sharding_2_t1 a join sharding_4_t1  b on a.id = b.id
-      """
-    Then execute sql in "dble-1" in "admin" mode
-      | conn   | toClose | sql                                                                                     | expect  | db               |
-      | conn_0 | true    | select conn_send_task_queue,sql from session_connections                                | success | dble_information |
-      | conn_0 | true    | flow_control @@list                                                                     | success | dble_information |
-      | conn_0 | true    | flow_control @@set enableFlowControl=true flowControlStart=2 flowControlEnd=1           | success | dble_information |
-
-    Then check following text exist "N" in file "/opt/dble/logs/dble.log" in host "dble-1"
-      """
-      begins flow control
-      remove flow control
-      NullPointerException
-      caught err:
-      """
-    Then execute sql in "dble-1" in "user" mode
-      | conn   | toClose | sql                                                   | expect        | db      | charset |
-      | conn_1 | true    | select * from sharding_2_t1 limit 100                 | length{(100)} | schema1 | utf8mb4 |
-    Given execute linux command in "dble-1"
-      """
-      rm -rf /opt/dble/Memory*
-      """
-    Then Restart dble in "dble-1" success
-
-
-    #####  case 4: supported complex select  #####
+    #####  case 3: complex select  #####
     Given execute sqls in "dble-1" at background
       | conn    | toClose | sql                                                                                     | db      | charset |
       | conn_5  | true    | select * from sharding_2_t1 where id in (select id from sharding_4_t1) order by id      | schema1 | utf8mb4 |
     Then execute sql in "dble-1" in "admin" mode
       | conn   | toClose | sql                                                                                     | expect  | db               |
-      | conn_0 | true    | select conn_send_task_queue,sql from session_connections                                | success | dble_information |
+      | conn_0 | true    | select * from dble_flow_control where flow_controlled=true                              | success | dble_information |
       | conn_0 | true    | flow_control @@list                                                                     | success | dble_information |
-      | conn_0 | true    | flow_control @@set enableFlowControl=true flowControlStart=2 flowControlEnd=1           | success | dble_information |
-
+      | conn_0 | true    | flow_control @@set flowControlHighLevel=262144 flowControlLowLevel=65536                | success | dble_information |
     Then check following text exist "N" in file "/tmp/dble_user_query.log" in host "dble-1"
       """
       closed
       Lost connection
       """
-    Given sleep "15" seconds
+    Given sleep "20" seconds
     Given kill mysql query in "dble-1" forcely
       """
       select * from sharding_2_t1 where id in (select id from sharding_4_t1) order by id
       """
     Then execute sql in "dble-1" in "admin" mode
       | conn   | toClose | sql                                                                                     | expect  | db               |
-      | conn_0 | true    | select conn_send_task_queue,sql from session_connections                                | success | dble_information |
+      | conn_0 | true    | select * from dble_flow_control where flow_controlled=true                              | success | dble_information |
       | conn_0 | true    | flow_control @@list                                                                     | success | dble_information |
-      | conn_0 | true    | flow_control @@set enableFlowControl=true flowControlStart=2 flowControlEnd=1           | success | dble_information |
     Then check following text exist "Y" in file "/opt/dble/logs/dble.log" in host "dble-1"
       """
-      begins flow control
-      remove flow control
+      This backend connection begins flow control, currentReadingSize=
+      This backend connection stop flow control, currentReadingSize=
       """
     Then execute sql in "dble-1" in "user" mode
       | conn   | toClose | sql                                                   | expect        | db      | charset |
       | conn_1 | true    | select * from sharding_2_t1 limit 100                 | length{(100)} | schema1 | utf8mb4 |
-
     Then check following text exist "N" in file "/opt/dble/logs/dble.log" in host "dble-1"
       """
       NullPointerException
       caught err:
       """
-    Given execute linux command in "dble-1"
-      """
-      rm -rf /opt/dble/Memory*
-      """
     Then Restart dble in "dble-1" success
 
 
-    #####  case 5: supported complex select  #####
+    #####  case 4: complex select  #####
     Given execute sqls in "dble-1" at background
       | conn    | toClose | sql                                                | db      | charset |
       | conn_6  | true    | select * from (select * from sharding_2_t1) a      | schema1 | utf8mb4 |
     Then execute sql in "dble-1" in "admin" mode
       | conn   | toClose | sql                                                                                     | expect  | db               |
-      | conn_0 | true    | select conn_send_task_queue,sql from session_connections                                | success | dble_information |
+      | conn_0 | true    | select * from dble_flow_control where flow_controlled=true                                | success | dble_information |
       | conn_0 | true    | flow_control @@list                                                                     | success | dble_information |
-      | conn_0 | true    | flow_control @@set enableFlowControl=true flowControlStart=2 flowControlEnd=1           | success | dble_information |
-
     Then check following text exist "N" in file "/tmp/dble_user_query.log" in host "dble-1"
       """
       closed
       Lost connection
       """
-    Given sleep "2" seconds
+    Given sleep "10" seconds
     Given kill mysql query in "dble-1" forcely
       """
       select * from (select * from sharding_2_t1) a
       """
     Then execute sql in "dble-1" in "admin" mode
       | conn   | toClose | sql                                                                                     | expect  | db               |
-      | conn_0 | true    | select conn_send_task_queue,sql from session_connections                                | success | dble_information |
+      | conn_0 | true    | select * from dble_flow_control where flow_controlled=true                                | success | dble_information |
       | conn_0 | true    | flow_control @@list                                                                     | success | dble_information |
-      | conn_0 | true    | flow_control @@set enableFlowControl=true flowControlStart=2 flowControlEnd=1           | success | dble_information |
 
     Then check following text exist "Y" in file "/opt/dble/logs/dble.log" in host "dble-1"
       """
-      begins flow control
-      remove flow control
+      This backend connection begins flow control, currentReadingSize=
+      This backend connection stop flow control, currentReadingSize=
       """
     Then execute sql in "dble-1" in "user" mode
       | conn   | toClose | sql                                                   | expect        | db      | charset |
@@ -276,22 +226,17 @@ Feature: test flow_control about complex query
       NullPointerException
       caught err:
       """
-    Given execute linux command in "dble-1"
-      """
-      rm -rf /opt/dble/Memory*
-      """
     Then Restart dble in "dble-1" success
 
 
-    #####  case 6: supported complex select  #####
+    #####  case 5: complex select  #####
     Given execute sqls in "dble-1" at background
       | conn    | toClose | sql                                                                       | db      | charset |
       | conn_7  | true    | select * from sharding_2_t1 union all select * from sharding_4_t1         | schema1 | utf8mb4 |
     Then execute sql in "dble-1" in "admin" mode
       | conn   | toClose | sql                                                                                     | expect  | db               |
-      | conn_0 | true    | select conn_send_task_queue,sql from session_connections                                | success | dble_information |
+      | conn_0 | true    | select * from dble_flow_control where flow_controlled=true                                | success | dble_information |
       | conn_0 | true    | flow_control @@list                                                                     | success | dble_information |
-      | conn_0 | true    | flow_control @@set enableFlowControl=true flowControlStart=2 flowControlEnd=1           | success | dble_information |
 
     Then check following text exist "N" in file "/tmp/dble_user_query.log" in host "dble-1"
       """
@@ -305,14 +250,13 @@ Feature: test flow_control about complex query
       """
     Then execute sql in "dble-1" in "admin" mode
       | conn   | toClose | sql                                                                                     | expect  | db               |
-      | conn_0 | true    | select conn_send_task_queue,sql from session_connections                                | success | dble_information |
+      | conn_0 | true    | select * from dble_flow_control where flow_controlled=true                                | success | dble_information |
       | conn_0 | true    | flow_control @@list                                                                     | success | dble_information |
-      | conn_0 | true    | flow_control @@set enableFlowControl=true flowControlStart=2 flowControlEnd=1           | success | dble_information |
 
     Then check following text exist "Y" in file "/opt/dble/logs/dble.log" in host "dble-1"
       """
-      begins flow control
-      remove flow control
+      This backend connection begins flow control, currentReadingSize=
+      This backend connection stop flow control, currentReadingSize=
       """
     Then execute sql in "dble-1" in "user" mode
       | conn   | toClose | sql                                                   | expect        | db      | charset |
@@ -323,42 +267,36 @@ Feature: test flow_control about complex query
       NullPointerException
       caught err:
       """
-    Given execute linux command in "dble-1"
-      """
-      rm -rf /opt/dble/Memory*
-      """
     Then Restart dble in "dble-1" success
 
-    #####  case 7: supported complex select  #####
+    #####  case 6: complex select  #####
     Given execute sqls in "dble-1" at background
       | conn    | toClose | sql                                                          | db      | charset |
       | conn_8  | true    | select * from sharding_2_t1 order by id limit 1000000000     | schema1 | utf8mb4 |
     Then execute sql in "dble-1" in "admin" mode
       | conn   | toClose | sql                                                                                     | expect  | db               |
-      | conn_0 | true    | select conn_send_task_queue,sql from session_connections                                | success | dble_information |
+      | conn_0 | true    | select * from dble_flow_control where flow_controlled=true                                | success | dble_information |
       | conn_0 | true    | flow_control @@list                                                                     | success | dble_information |
-      | conn_0 | true    | flow_control @@set enableFlowControl=true flowControlStart=2 flowControlEnd=1           | success | dble_information |
 
     Then check following text exist "N" in file "/tmp/dble_user_query.log" in host "dble-1"
       """
       closed
       Lost connection
       """
-    Given sleep "20" seconds
+    Given sleep "10" seconds
     Given kill mysql query in "dble-1" forcely
       """
       select * from sharding_2_t1 order by id limit 1000000000
       """
     Then execute sql in "dble-1" in "admin" mode
       | conn   | toClose | sql                                                                                     | expect  | db               |
-      | conn_0 | true    | select conn_send_task_queue,sql from session_connections                                | success | dble_information |
+      | conn_0 | true    | select * from dble_flow_control where flow_controlled=true                                | success | dble_information |
       | conn_0 | true    | flow_control @@list                                                                     | success | dble_information |
-      | conn_0 | true    | flow_control @@set enableFlowControl=true flowControlStart=2 flowControlEnd=1           | success | dble_information |
 
     Then check following text exist "Y" in file "/opt/dble/logs/dble.log" in host "dble-1"
       """
-      begins flow control
-      remove flow control
+      This backend connection begins flow control, currentReadingSize=
+      This backend connection stop flow control, currentReadingSize=
       """
     Then execute sql in "dble-1" in "user" mode
       | conn   | toClose | sql                                                   | expect        | db      | charset |
@@ -369,11 +307,35 @@ Feature: test flow_control about complex query
       NullPointerException
       caught err:
       """
+
+    #####  case 7: close flow control, select big results will occur OOM  #####
+    Then execute sql in "dble-1" in "admin" mode
+      | conn   | toClose | sql                                                                                     | expect      | db               |
+      | conn_0 | true    | flow_control @@set enableFlowControl=false                                              | success     | dble_information |
+      | conn_0 | true    | flow_control @@show                                                                     | length{(0)} | dble_information |
+      | conn_0 | true    | flow_control @@list                                                                     | length{(0)} | dble_information |
+    Given record current dble log line number in "log_linenu"
+    Given execute sqls in "dble-1" at background
+      | conn    | toClose | sql                                                          | db      | charset |
+      | conn_8  | true    | select * from sharding_2_t1 join sharding_4_t1               | schema1 | utf8mb4 |
+    #这里可能需要超过1min才能返回oom
+    Given sleep "120" seconds
+    Then check following text exist "Y" in file "/tmp/dble_user_query.log" in host "dble-1"
+    """
+    java.lang.OutOfMemoryError
+    """
+    Then execute sql in "dble-1" in "user" mode
+      | conn   | toClose | sql                                                   | expect        | db      | charset |
+      | conn_1 | true    | select * from sharding_2_t1 limit 100                 | length{(100)} | schema1 | utf8mb4 |
+    Then check following text exist "N" in file "/opt/dble/logs/dble.log" in host "dble-1"
+      """
+      This backend connection begins flow control, currentReadingSize=
+      This front connection begins flow control, currentWritingSize=
+      """
     Given execute linux command in "dble-1"
       """
       rm -rf /opt/dble/Memory*
       """
-
     Then execute sql in "dble-1" in "user" mode
       | conn   | toClose | sql                                         | expect  | db      | charset |
       | conn_1 | true    | drop table if exists sharding_2_t1          | success | schema1 | utf8mb4 |

@@ -134,6 +134,11 @@ def step_impl(context, btraceScript, host, num_expr="==1"):
 
 
 def kill_query(sshClient, query, context):
+    # check the pid exists
+    cmd0 = u"ps -ef | grep -F '{0}'| grep -v grep | awk '{{print $2}}'".format(query)
+    rc0, sto0, ste0 = sshClient.exec_command(cmd0)
+    assert len(sto0) > 0, "sql '{0}' runs over, its pid does exist any more.".format(query)
+
     cmd = u"kill -9 `ps -ef | grep -F '{0}'| grep -v grep | awk '{{print $2}}'`".format(query)
     rc, sto, ste = sshClient.exec_command(cmd)
     assert len(ste) == 0, "kill query client failed for: {0}".format(ste)

@@ -1,11 +1,14 @@
 # Copyright (C) 2016-2021 ActionTech.
 # License: https://www.mozilla.org/en-US/MPL/2.0 MPL version 2 or higher.
 # update by quexiuping at 2021/7/22
+# modified by wujinling at 2021/10/19
 
 Feature: test flow_control about simple query
-@skip
-  Scenario: test flow_control about simple query   # 1
-    # prepare data
+  @delete_mysql_tables
+  Scenario: test flow_control about simple query   #1
+    """
+    {'delete_mysql_tables':['mysql-master1','mysql-master2']}
+    """
     Given update file content "/opt/dble/conf/bootstrap.cnf" in "dble-1" with sed cmds
        """
        s/-Xmx1G/-Xmx4G/
@@ -18,13 +21,32 @@ Feature: test flow_control about simple query
        $a -DfrontSocketSoSndbuf=4096
        $a -DfrontSocketNoDelay=0
        $a -DenableFlowControl=true
-       $a -DflowControlStartThreshold=2
-       $a -DflowControlStopThreshold=1
+       $a -DflowControlHighLevel=1048576
+       $a -DflowControlLowLevel=262144
        $a -DsqlExecuteTimeout=1800000
        $a -DidleTimeout=1800000
        """
+    Given add xml segment to node with attribute "{'tag':'root'}" in "db.xml"
+    """
+    <dbGroup rwSplitMode="0" name="ha_group1" delayThreshold="100" >
+        <heartbeat>select user()</heartbeat>
+        <dbInstance name="M1" password="111111" url="172.100.9.5:3307" user="test" maxCon="100" minCon="10" primary="true">
+             <property name="flowHighLevel">8388608</property>
+             <property name="flowLowLevel">262144</property>
+        </dbInstance>
+     </dbGroup>
+
+    <dbGroup rwSplitMode="0" name="ha_group2" delayThreshold="100" >
+        <heartbeat>select user()</heartbeat>
+        <dbInstance name="hostM2" password="111111" url="172.100.9.6:3307" user="test" maxCon="100" minCon="10" primary="true">
+             <property name="flowHighLevel">8388608</property>
+             <property name="flowLowLevel">262144</property>
+        </dbInstance>
+    </dbGroup>
+     """
     Then Restart dble in "dble-1" success
 
+    # prepare data
     Then execute sql in "dble-1" in "user" mode
       | conn   | toClose | sql                                                                                                                                                                  | expect  | db      | charset |
       | conn_1 | False   | drop table if exists sharding_2_t1                                                                                                                                   | success | schema1 | utf8mb4 |
@@ -35,10 +57,10 @@ Feature: test flow_control about simple query
       | conn_1 | true    | insert into test1 values (1,repeat("中",32),repeat("华",32),repeat("民",32),repeat("国",32)),(2,repeat("中",32),repeat("华",32),repeat("民",32),repeat("国",32))         | success | schema1 | utf8mb4 |
 
     #prepare more data
-    Given execute sql "22" times in "dble-1" at concurrent 22
+    Given execute sql "20" times in "dble-1" at concurrent 20
       | sql                                                                                | db      |
       | insert into sharding_2_t1(id,a,b,c,d) select id,a,b,c,d from sharding_2_t1         | schema1 |
-    Given execute sql "22" times in "dble-1" at concurrent 22
+    Given execute sql "20" times in "dble-1" at concurrent 20
       | sql                                                                | db      |
       | insert into test1(id,a,b,c,d) select id,a,b,c,d from test1         | schema1 |
     Then Restart dble in "dble-1" success
@@ -50,7 +72,7 @@ Feature: test flow_control about simple query
       | conn_2  | true    | select * from sharding_2_t1 limit 10000000000     | schema1 | utf8mb4 |
     Then execute sql in "dble-1" in "admin" mode
       | conn   | toClose | sql                                                                                     | expect  | db               |
-      | conn_0 | true    | select conn_send_task_queue,sql from session_connections                                | success | dble_information |
+      | conn_0 | true    | select * from dble_flow_control where flow_controlled=true                              | success | dble_information |
       | conn_0 | true    | flow_control @@list                                                                     | success | dble_information |
 
     Then check following text exist "N" in file "/tmp/dble_user_query.log" in host "dble-1"
@@ -58,16 +80,18 @@ Feature: test flow_control about simple query
       closed
       Lost connection
       """
-    Given sleep "3" seconds
+    Given sleep "5" seconds
     Then execute sql in "dble-1" in "admin" mode
       | conn   | toClose | sql                                                                                     | expect  | db               |
-      | conn_0 | true    | select conn_send_task_queue,sql from session_connections                                | success | dble_information |
+      | conn_0 | true    | select * from dble_flow_control where flow_controlled=true                              | success | dble_information |
       | conn_0 | true    | flow_control @@list                                                                     | success | dble_information |
 
     Then check following text exist "Y" in file "/opt/dble/logs/dble.log" in host "dble-1"
       """
-      begins flow control
-      remove flow control
+      This backend connection begins flow control
+      This backend connection stop flow control
+      This front connection begins flow control
+      This front connection remove flow control
       """
     Then check following text exist "N" in file "/opt/dble/logs/dble.log" in host "dble-1"
       """
@@ -91,7 +115,7 @@ Feature: test flow_control about simple query
       | conn_3  | true    | select * from test1 limit 10000000000     | schema1 | utf8mb4 |
     Then execute sql in "dble-1" in "admin" mode
       | conn   | toClose | sql                                                                                     | expect  | db               |
-      | conn_0 | true    | select conn_send_task_queue,sql from session_connections                                | success | dble_information |
+      | conn_0 | true    | select * from dble_flow_control where flow_controlled=true                                | success | dble_information |
       | conn_0 | true    | flow_control @@list                                                                     | success | dble_information |
 
     Then check following text exist "N" in file "/tmp/dble_user_query.log" in host "dble-1"
@@ -106,13 +130,15 @@ Feature: test flow_control about simple query
       """
     Then execute sql in "dble-1" in "admin" mode
       | conn   | toClose | sql                                                                                     | expect  | db               |
-      | conn_0 | true    | select conn_send_task_queue,sql from session_connections                                | success | dble_information |
+      | conn_0 | true    | select * from dble_flow_control where flow_controlled=true                              | success | dble_information |
       | conn_0 | true    | flow_control @@list                                                                     | success | dble_information |
 
     Then check following text exist "Y" in file "/opt/dble/logs/dble.log" in host "dble-1"
       """
-      begins flow control
-      remove flow control
+      This front connection begins flow control
+      This front connection remove flow control
+      This backend connection begins flow control
+      This backend connection stop flow control
       """
     Then execute sql in "dble-1" in "user" mode
       | conn   | toClose | sql                                                   | expect        | db      | charset |
